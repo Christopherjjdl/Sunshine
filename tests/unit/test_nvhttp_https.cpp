@@ -1,6 +1,6 @@
 /**
  * @file tests/unit/test_nvhttp_https.cpp
- * @brief Verify HTTPS callbacks retain the guard protecting server lifetime.
+ * @brief Verify HTTPS callbacks retain the guard protecting server lifetime, and that closing an HTTPS stream does not wait on the peer.
  */
 
 // test includes
@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <thread>
 
 // local includes
@@ -156,5 +157,51 @@ namespace {
     client.close();
     server->io_service->run_for(2s);
     EXPECT_EQ(error_callbacks, 0);
+  }
+
+  /**
+   * @brief Destroying an established HTTPS stream does not wait for the peer's close_notify.
+   *
+   * The destructor runs on the HTTPS server's only thread, so waiting here would stall every
+   * later request for as long as a client that has gone away keeps its connection open.
+   */
+  TEST(SunshineHttpsShutdownTest, DestructorDoesNotWaitForPeerCloseNotify) {
+    const auto credentials = crypto::gen_creds("Sunshine HTTPS shutdown test", 2048);
+    boost::asio::ssl::context server_context {boost::asio::ssl::context::tls_server};
+    server_context.use_certificate_chain(boost::asio::buffer(credentials.x509));
+    server_context.use_private_key(boost::asio::buffer(credentials.pkey), boost::asio::ssl::context::pem);
+    boost::asio::ssl::context client_context {boost::asio::ssl::context::tls_client};
+    client_context.set_verify_mode(boost::asio::ssl::verify_none);
+
+    boost::asio::io_context io_context;
+    tcp::acceptor acceptor {io_context, {boost::asio::ip::address_v4::loopback(), 0}};
+    auto server = std::make_unique<nvhttp::SunshineHTTPS>(io_context, server_context);
+    boost::asio::ssl::stream<tcp::socket> client {io_context, client_context};
+    client.lowest_layer().connect(acceptor.local_endpoint());
+    acceptor.accept(server->lowest_layer());
+
+    auto client_handshake = std::async(std::launch::async, [&client]() {
+      boost::system::error_code handshake_error;
+      client.handshake(boost::asio::ssl::stream_base::client, handshake_error);
+      return handshake_error;
+    });
+    boost::system::error_code server_handshake_error;
+    server->handshake(boost::asio::ssl::stream_base::server, server_handshake_error);
+    const auto client_handshake_error = client_handshake.get();
+    ASSERT_FALSE(server_handshake_error) << server_handshake_error.message();
+    ASSERT_FALSE(client_handshake_error) << client_handshake_error.message();
+
+    // The client stays connected but never reads or answers, like a peer whose close was lost.
+    auto destroyed = std::async(std::launch::async, [&server]() {
+      server.reset();
+    });
+    const auto status = destroyed.wait_for(2s);
+    if (status != std::future_status::ready) {
+      // Unblock a destructor that is waiting for the peer, so the test can finish.
+      boost::system::error_code close_error;
+      client.lowest_layer().close(close_error);
+    }
+    destroyed.wait();
+    EXPECT_EQ(status, std::future_status::ready);
   }
 }  // namespace
